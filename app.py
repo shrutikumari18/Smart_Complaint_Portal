@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, session
+from flask import Flask, jsonify, request, send_from_directory, session
 import mysql.connector
 import os
 from dotenv import load_dotenv
@@ -30,17 +30,45 @@ def current_identity():
 # ---------------- DB CONNECTION ----------------
 def get_db_connection():
     return mysql.connector.connect(
-        host=os.getenv("DB_HOST"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        database=os.getenv("DB_NAME")
+        host=os.getenv("DB_HOST") or os.getenv("MYSQLHOST"),
+        port=int(os.getenv("DB_PORT") or os.getenv("MYSQLPORT") or 3306),
+        user=os.getenv("DB_USER") or os.getenv("MYSQLUSER"),
+        password=os.getenv("DB_PASSWORD") or os.getenv("MYSQLPASSWORD"),
+        database=os.getenv("DB_NAME") or os.getenv("MYSQLDATABASE")
     )
 
 
 # ---------------- REACT API ----------------
+@app.get("/api/health")
+def api_health():
+    return jsonify({"status": "ok"})
+
+
 @app.get("/api/session")
 def api_session():
     return jsonify({"user": current_identity()})
+
+
+@app.get("/api/public-stats")
+def api_public_stats():
+    """Privacy-safe aggregate data for the public landing page."""
+    db = cursor = None
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("SELECT COUNT(*) AS total FROM complaints")
+        total = cursor.fetchone()["total"]
+        cursor.execute("SELECT COUNT(*) AS pending FROM complaints WHERE status='pending'")
+        pending = cursor.fetchone()["pending"]
+        cursor.execute("SELECT COUNT(*) AS resolved FROM complaints WHERE status='resolved'")
+        resolved = cursor.fetchone()["resolved"]
+        rate = round((resolved / total) * 100) if total else 0
+        return jsonify({"total": total, "pending": pending, "resolved": resolved, "resolution_rate": rate})
+    finally:
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
 
 
 @app.post("/api/register")
@@ -151,6 +179,77 @@ def api_dashboard():
             db.close()
 
 
+@app.post("/api/feedback")
+def api_feedback():
+    if "user_id" not in session:
+        return api_error("Please log in first.", 401)
+    payload = request.get_json(silent=True) or {}
+    rating = payload.get("rating")
+    message = payload.get("message", "").strip()
+    if not isinstance(rating, int) or rating < 1 or rating > 5 or not message:
+        return api_error("Please select a rating and write your feedback.")
+    db = cursor = None
+    try:
+        db = get_db_connection()
+        cursor = db.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                rating TINYINT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        cursor.execute(
+            "INSERT INTO feedback (user_id, rating, message) VALUES (%s, %s, %s)",
+            (session["user_id"], rating, message)
+        )
+        db.commit()
+        return jsonify({"message": "Thank you. Your feedback has been submitted."}), 201
+    finally:
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
+
+
+@app.get("/api/admin/feedback")
+def api_admin_feedback():
+    if "admin" not in session:
+        return api_error("Admin login required.", 401)
+    db = cursor = None
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                rating TINYINT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        cursor.execute("""
+            SELECT feedback.id, users.username, feedback.rating, feedback.message, feedback.created_at
+            FROM feedback JOIN users ON feedback.user_id = users.id
+            ORDER BY feedback.created_at DESC
+        """)
+        feedback = cursor.fetchall()
+        for item in feedback:
+            if item.get("created_at"):
+                item["created_at"] = item["created_at"].isoformat(sep=" ")
+        return jsonify({"feedback": feedback})
+    finally:
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
+
+
 @app.get("/api/complaints")
 def api_complaints():
     if "user_id" not in session:
@@ -231,6 +330,29 @@ def api_add_complaint():
             db.close()
 
 
+@app.delete("/api/complaints/<int:complaint_id>")
+def api_delete_own_complaint(complaint_id):
+    if "user_id" not in session:
+        return api_error("Please log in first.", 401)
+    db = cursor = None
+    try:
+        db = get_db_connection()
+        cursor = db.cursor()
+        cursor.execute(
+            "DELETE FROM complaints WHERE id=%s AND user_id=%s",
+            (complaint_id, session["user_id"])
+        )
+        db.commit()
+        if cursor.rowcount == 0:
+            return api_error("Complaint not found or you do not have permission to delete it.", 404)
+        return jsonify({"message": "Complaint deleted successfully."})
+    finally:
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
+
+
 @app.get("/api/admin/complaints")
 def api_admin_complaints():
     if "admin" not in session:
@@ -304,6 +426,22 @@ def api_delete_complaint(complaint_id):
 def api_logout():
     session.clear()
     return jsonify({"message": "Logged out successfully."})
+
+
+FRONTEND_DIST = os.path.join(app.root_path, "frontend", "dist")
+
+
+@app.get("/")
+@app.get("/<path:path>")
+def serve_frontend(path=""):
+    """Serve the built React app in production; Vite handles it in local development."""
+    if not os.path.isdir(FRONTEND_DIST):
+        return api_error("Frontend build not found. Run the Vite development server locally.", 404)
+    requested_file = os.path.join(FRONTEND_DIST, path)
+    if path and os.path.isfile(requested_file):
+        return send_from_directory(FRONTEND_DIST, path)
+    return send_from_directory(FRONTEND_DIST, "index.html")
+
 
 if __name__ == "__main__":
     app.run(debug=True)
