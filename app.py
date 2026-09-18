@@ -1,14 +1,31 @@
-from flask import Flask, render_template, request, redirect, session, flash
+from flask import Flask, jsonify, request, session
 import mysql.connector
 import os
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from uuid import uuid4
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY")
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+UPLOAD_FOLDER = os.path.join(app.root_path, "static", "uploads")
+ALLOWED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+
+
+def api_error(message, status=400):
+    return jsonify({"error": message}), status
+
+
+def current_identity():
+    if "admin" in session:
+        return {"type": "admin", "username": session.get("admin_username", "Admin")}
+    if "user_id" in session:
+        return {"type": "user", "id": session["user_id"], "username": session["username"]}
+    return None
 
 # ---------------- DB CONNECTION ----------------
 def get_db_connection():
@@ -19,248 +36,274 @@ def get_db_connection():
         database=os.getenv("DB_NAME")
     )
 
-# ---------------- HOME ----------------
-@app.route("/")
-def home():
-    if "admin" in session:
-        return redirect("/admin-dashboard")
-    if "user_id" in session:
-        return redirect("/dashboard")
-    return render_template("home.html")
 
-# ---------------- REGISTER ----------------
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    if request.method == "POST":
-        username = request.form["username"].strip()
-        email = request.form["email"].strip()
-        password = request.form["password"]
+# ---------------- REACT API ----------------
+@app.get("/api/session")
+def api_session():
+    return jsonify({"user": current_identity()})
 
-        hashed_pw = generate_password_hash(password)
 
-        try:
-            db = get_db_connection()
-            cursor = db.cursor(dictionary=True)
-            cursor.execute(
-                "INSERT INTO users (username,email,password) VALUES (%s,%s,%s)",
-                (username, email, hashed_pw)
-            )
-            db.commit()
-            flash("Registration successful! Please log in.", "success")
-        except Exception as e:
-            flash(f"Error: {e}", "danger")
-        finally:
+@app.post("/api/register")
+def api_register():
+    payload = request.get_json(silent=True) or {}
+    username = payload.get("username", "").strip()
+    email = payload.get("email", "").strip()
+    password = payload.get("password", "")
+
+    if not username or not email or not password:
+        return api_error("Username, email and password are required.")
+
+    db = cursor = None
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "INSERT INTO users (username,email,password) VALUES (%s,%s,%s)",
+            (username, email, generate_password_hash(password))
+        )
+        db.commit()
+        return jsonify({"message": "Registration successful. Please log in."}), 201
+    except Exception as error:
+        return api_error(str(error), 409)
+    finally:
+        if cursor:
             cursor.close()
+        if db:
             db.close()
 
-        return redirect("/login")
 
-    return render_template("register.html")
-
-# ---------------- LOGIN ----------------
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        email = request.form["email"].strip()
-        password = request.form["password"]
-
+@app.post("/api/login")
+def api_login():
+    payload = request.get_json(silent=True) or {}
+    email = payload.get("email", "").strip()
+    password = payload.get("password", "")
+    db = cursor = None
+    try:
         db = get_db_connection()
         cursor = db.cursor(dictionary=True)
         cursor.execute("SELECT * FROM users WHERE email=%s", (email,))
         user = cursor.fetchone()
-        cursor.close()
-        db.close()
-
-        if user and check_password_hash(user["password"], password):
-            session["user_id"] = user["id"]
-            session["username"] = user["username"]
-            return redirect("/dashboard")
-        else:
-            flash("Invalid email or password", "danger")
-
-    return render_template("login.html")
-
-# ---------------- USER DASHBOARD ----------------
-@app.route("/dashboard")
-def dashboard():
-    if "user_id" not in session:
-        return redirect("/login")
-
-    db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
-
-    cursor.execute("SELECT COUNT(*) AS total FROM complaints WHERE user_id=%s", (session["user_id"],))
-    total = cursor.fetchone()["total"]
-
-    cursor.execute("SELECT COUNT(*) AS pending FROM complaints WHERE user_id=%s AND status='pending'", (session["user_id"],))
-    pending = cursor.fetchone()["pending"]
-
-    cursor.execute("SELECT COUNT(*) AS resolved FROM complaints WHERE user_id=%s AND status='resolved'", (session["user_id"],))
-    resolved = cursor.fetchone()["resolved"]
-
-    cursor.close()
-    db.close()
-
-    return render_template("dashboard.html",
-                           username=session["username"],
-                           total=total,
-                           pending=pending,
-                           resolved=resolved)
-
-# ---------------- MY COMPLAINTS ----------------
-@app.route("/my-complaints")
-def my_complaints():
-    if "user_id" not in session:
-        return redirect("/login")
-
-    db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM complaints WHERE user_id=%s", (session["user_id"],))
-    complaints = cursor.fetchall()
-    cursor.close()
-    db.close()
-
-    return render_template("my_complaints.html", complaints=complaints, username=session["username"])
-
-# ---------------- ADD COMPLAINT ----------------
-@app.route("/add-complaint", methods=["GET", "POST"])
-def add_complaint():
-    if "user_id" not in session:
-        return redirect("/login")
-
-    if request.method == "POST":
-        title = request.form["title"].strip()
-        category = request.form["category"].strip()
-        description = request.form["description"].strip()
-
-        try:
-            db = get_db_connection()
-            cursor = db.cursor(dictionary=True)
-            cursor.execute(
-                "INSERT INTO complaints (user_id, title, category, description, status) VALUES (%s, %s, %s, %s, %s)",
-                (session["user_id"], title, category, description, "pending")
-            )
-            db.commit()
-            flash("Complaint added successfully!", "success")
-        except Exception as e:
-            flash(f"Error: {e}", "danger")
-        finally:
+        if not user or not check_password_hash(user["password"], password):
+            return api_error("Invalid email or password.", 401)
+        session["user_id"] = user["id"]
+        session["username"] = user["username"]
+        return jsonify({"user": current_identity()})
+    finally:
+        if cursor:
             cursor.close()
+        if db:
             db.close()
 
-        return redirect("/my-complaints")
 
-    return render_template("add_complaint.html")
+@app.post("/api/forgot-password")
+def api_forgot_password():
+    payload = request.get_json(silent=True) or {}
+    email = payload.get("email", "").strip()
+    if not email:
+        return api_error("Please enter your registered email address.")
+    # Email delivery is intentionally kept separate from the login system.
+    # This response does not reveal whether an account exists for an address.
+    return jsonify({"message": "If an account exists for this email, a password-reset request has been recorded. Please contact the portal administrator to complete the reset."})
 
-# ---------------- ADMIN LOGIN ----------------
-@app.route("/admin", methods=["GET", "POST"])
-def admin_login():
-    if "admin" in session:
-        return redirect("/admin-dashboard")
 
-    if request.method == "POST":
-        username = request.form["username"].strip()
-        password = request.form["password"]
-
+@app.post("/api/admin/login")
+def api_admin_login():
+    payload = request.get_json(silent=True) or {}
+    username = payload.get("username", "").strip()
+    password = payload.get("password", "")
+    db = cursor = None
+    try:
         db = get_db_connection()
         cursor = db.cursor(dictionary=True)
         cursor.execute("SELECT * FROM admin WHERE username=%s", (username,))
         admin = cursor.fetchone()
-        cursor.close()
-        db.close()
+        if not admin or not check_password_hash(admin["password"], password):
+            return api_error("Invalid admin credentials.", 401)
+        session["admin"] = True
+        session["admin_username"] = admin["username"]
+        return jsonify({"user": current_identity()})
+    finally:
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
 
-        if admin and check_password_hash(admin["password"], password):
-            session["admin"] = True
-            session["admin_username"] = admin["username"]
-            return redirect("/admin-dashboard")
-        else:
-            flash("Invalid admin credentials", "danger")
 
-    return render_template("admin_login.html")
+@app.get("/api/dashboard")
+def api_dashboard():
+    if "user_id" not in session:
+        return api_error("Please log in first.", 401)
+    db = cursor = None
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("SELECT COUNT(*) AS total FROM complaints WHERE user_id=%s", (session["user_id"],))
+        total = cursor.fetchone()["total"]
+        cursor.execute("SELECT COUNT(*) AS pending FROM complaints WHERE user_id=%s AND status='pending'", (session["user_id"],))
+        pending = cursor.fetchone()["pending"]
+        cursor.execute("SELECT COUNT(*) AS resolved FROM complaints WHERE user_id=%s AND status='resolved'", (session["user_id"],))
+        resolved = cursor.fetchone()["resolved"]
+        return jsonify({"total": total, "pending": pending, "resolved": resolved})
+    finally:
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
 
-# ---------------- ADMIN DASHBOARD ----------------
-# ---------------- ADMIN DASHBOARD ----------------
-@app.route("/admin-dashboard")
-def admin_dashboard():
+
+@app.get("/api/complaints")
+def api_complaints():
+    if "user_id" not in session:
+        return api_error("Please log in first.", 401)
+    db = cursor = None
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM complaints WHERE user_id=%s ORDER BY created_at DESC", (session["user_id"],))
+        complaints = cursor.fetchall()
+        for complaint in complaints:
+            if complaint.get("created_at"):
+                complaint["created_at"] = complaint["created_at"].isoformat(sep=" ")
+        return jsonify({"complaints": complaints})
+    finally:
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
+
+
+@app.post("/api/complaints")
+def api_add_complaint():
+    if "user_id" not in session:
+        return api_error("Please log in first.", 401)
+    payload = request.form if request.form else (request.get_json(silent=True) or {})
+    title = payload.get("title", "").strip()
+    complaint_type = payload.get("type", "").strip()
+    issue = payload.get("issue", "").strip()
+    category = " — ".join(part for part in [complaint_type, issue] if part) or payload.get("category", "").strip()
+    description = payload.get("description", "").strip()
+    if not title or not category or not description:
+        return api_error("Title, category and description are required.")
+
+    details = []
+    field_labels = {
+        "location": "Location", "landmark": "Landmark", "incidentDate": "Incident date",
+        "name": "Contact name", "phone": "Phone", "email": "Email"
+    }
+    for field, label in field_labels.items():
+        value = payload.get(field, "").strip()
+        if value:
+            details.append(f"{label}: {value}")
+    for field in payload.keys():
+        if field.startswith("extra_"):
+            value = payload.get(field, "").strip()
+            if value:
+                details.append(f"{field[6:]}: {value}")
+    if payload.get("anonymous") == "true":
+        details.append("Submitted anonymously")
+
+    photo = request.files.get("photo")
+    if photo and photo.filename:
+        extension = photo.filename.rsplit(".", 1)[-1].lower() if "." in photo.filename else ""
+        if extension not in ALLOWED_IMAGE_EXTENSIONS:
+            return api_error("Please upload a JPG, PNG, or WEBP image.")
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        filename = f"{uuid4().hex}_{secure_filename(photo.filename)}"
+        photo.save(os.path.join(UPLOAD_FOLDER, filename))
+        details.append(f"Evidence photo: /static/uploads/{filename}")
+
+    if details:
+        description = f"{description}\n\n" + "\n".join(details)
+    db = cursor = None
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "INSERT INTO complaints (user_id, title, category, description, status) VALUES (%s, %s, %s, %s, %s)",
+            (session["user_id"], title, category, description, "pending")
+        )
+        db.commit()
+        return jsonify({"message": "Complaint added successfully."}), 201
+    finally:
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
+
+
+@app.get("/api/admin/complaints")
+def api_admin_complaints():
     if "admin" not in session:
-        return redirect("/admin")
+        return api_error("Admin login required.", 401)
+    db = cursor = None
+    try:
+        db = get_db_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT complaints.id, users.username, complaints.title, complaints.category,
+                   complaints.description, complaints.status, complaints.created_at
+            FROM complaints JOIN users ON complaints.user_id = users.id
+            ORDER BY complaints.created_at DESC
+        """)
+        complaints = cursor.fetchall()
+        for complaint in complaints:
+            if complaint.get("created_at"):
+                complaint["created_at"] = complaint["created_at"].isoformat(sep=" ")
+        return jsonify({
+            "complaints": complaints,
+            "pending": sum(item["status"] == "pending" for item in complaints),
+            "resolved": sum(item["status"] == "resolved" for item in complaints)
+        })
+    finally:
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
 
-    db = get_db_connection()
-    cursor = db.cursor(dictionary=True)
 
-    # Complaints with user info
-    cursor.execute("""
-        SELECT complaints.id, users.username, complaints.title, complaints.category, complaints.description, complaints.status, complaints.created_at
-        FROM complaints
-        JOIN users ON complaints.user_id = users.id
-    """)
-    data = cursor.fetchall()
-
-    # Pending count
-    cursor.execute("SELECT COUNT(*) AS pending FROM complaints WHERE status='pending'")
-    pending = cursor.fetchone()["pending"]
-
-    # Resolved count
-    cursor.execute("SELECT COUNT(*) AS resolved FROM complaints WHERE status='resolved'")
-    resolved = cursor.fetchone()["resolved"]
-
-    cursor.close()
-    db.close()
-
-    return render_template("admin_dashboard.html", data=data, pending=pending, resolved=resolved)
-
-# ---------------- UPDATE COMPLAINT STATUS ----------------
-@app.route("/update-complaint/<int:complaint_id>/<string:new_status>")
-def update_complaint(complaint_id, new_status):
+@app.patch("/api/admin/complaints/<int:complaint_id>")
+def api_update_complaint(complaint_id):
     if "admin" not in session:
-        flash("Unauthorized access!", "danger")
-        return redirect("/login")
-
+        return api_error("Admin login required.", 401)
+    new_status = (request.get_json(silent=True) or {}).get("status")
     if new_status not in ["pending", "resolved"]:
-        flash("Invalid status value!", "danger")
-        return redirect("/admin-dashboard")
-
+        return api_error("Invalid status value.")
+    db = cursor = None
     try:
         db = get_db_connection()
         cursor = db.cursor(dictionary=True)
         cursor.execute("UPDATE complaints SET status=%s WHERE id=%s", (new_status, complaint_id))
         db.commit()
-        flash("Complaint status updated successfully!", "success")
-    except Exception as e:
-        flash(f"Error: {e}", "danger")
+        return jsonify({"message": "Complaint status updated."})
     finally:
-        cursor.close()
-        db.close()
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
 
-    return redirect("/admin-dashboard")
 
-# ---------------- DELETE COMPLAINT ----------------
-@app.route("/delete-complaint/<int:complaint_id>")
-def delete_complaint(complaint_id):
+@app.delete("/api/admin/complaints/<int:complaint_id>")
+def api_delete_complaint(complaint_id):
     if "admin" not in session:
-        flash("Unauthorized access!", "danger")
-        return redirect("/login")
-
+        return api_error("Admin login required.", 401)
+    db = cursor = None
     try:
         db = get_db_connection()
         cursor = db.cursor(dictionary=True)
         cursor.execute("DELETE FROM complaints WHERE id=%s", (complaint_id,))
         db.commit()
-        flash("Complaint deleted successfully!", "success")
-    except Exception as e:
-        flash(f"Error: {e}", "danger")
+        return jsonify({"message": "Complaint deleted."})
     finally:
-        cursor.close()
-        db.close()
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
 
-    return redirect("/admin-dashboard")
 
-# ---------------- LOGOUT ----------------
-@app.route("/logout")
-def logout():
+@app.post("/api/logout")
+def api_logout():
     session.clear()
-    flash("Logged out successfully!", "info")
-    return redirect("/")
+    return jsonify({"message": "Logged out successfully."})
 
 if __name__ == "__main__":
     app.run(debug=True)

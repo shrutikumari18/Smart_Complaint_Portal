@@ -1,7 +1,7 @@
 ## 📝 Complaint Box – Mini Full Stack Project
 
 A simple "Full-stack web application" where users can register, log in, submit complaints, and an admin can view all complaints.
-This project is built for learning full-stack development using Flask and MySQL.
+This project is built for learning full-stack development using React, Flask and MySQL.
 
 
 ## 🚀 Features
@@ -22,7 +22,7 @@ This project is built for learning full-stack development using Flask and MySQL.
 
 ## 🛠️ Tech Stack
 
-1. Frontend: HTML, CSS
+1. Frontend: React + Vite
 2. Backend: Python (Flask)
 3. Database: MySQL
 4. Environment Variables: python-dotenv
@@ -37,9 +37,10 @@ and put the following code-
        DB_HOST=localhost
        DB_USER=root
        DB_PASSWORD=your_mysql_password
-       DB_NAME=complaint_db
+     DB_NAME=complaint_box
+     SECRET_KEY=replace_with_a_long_random_secret
 
-       SECURITY_KEY = MY_SECURITY_KEY
+Use `.env.example` as the template, then save your actual values in `.env`.
 
 
 
@@ -85,13 +86,21 @@ venv\Scripts\activate
 #### 3️⃣ Install dependencies
 pip install -r requirements.txt
 #### ▶️ Run the Project
+#### Start the Flask API (from the project root)
 python app.py
+
+#### Start the React frontend (in a second terminal)
+cd frontend
+npm install
+npm run dev
+
+Open the frontend URL shown by Vite, usually `http://localhost:5173`.
 
 
 
 ## 📌 Notes
 
-1. Password hashing is not implemented (for simplicity & learning purpose).
+1. Passwords are stored using Werkzeug hashing.
 2. This project is suitable for:
      College mini-project
      Full-stack practice
@@ -101,10 +110,9 @@ python app.py
 
 ## 🌟 Future Improvements
 
-1. Password hashing
-2. Complaint status (pending/resolved)
-3. Better UI with navbar & card
-4. User complaint history page
+1. Email notifications for status changes
+2. File attachments on complaints
+3. Production deployment configuration
 
 
 
